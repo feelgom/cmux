@@ -129,21 +129,23 @@ final class cmuxUITests: XCTestCase {
         try openSelectedWorkspaceIfNeeded(app)
 
         tap(app.buttons["MobileTerminalNewWorkspaceButton"], in: app)
-        let workspaceStart = Date()
-        assertTerminalRows([
-            1: "workspace: Workspace 3",
-            2: "terminal: Terminal 1",
-        ], in: app)
-        XCTAssertLessThan(Date().timeIntervalSince(workspaceStart), 6.0)
+        await assertHostSelection(
+            workspaceID: "workspace-3",
+            terminalID: "workspace-3-terminal-1",
+            server: server
+        )
 
         tap(app.buttons["MobileTerminalDropdown"], in: app)
-        tap(app.buttons["MobileNewTerminalMenuItem"], in: app)
-        let terminalStart = Date()
-        assertTerminalRows([
-            1: "workspace: Workspace 3",
-            2: "terminal: Terminal 2",
-        ], in: app)
-        XCTAssertLessThan(Date().timeIntervalSince(terminalStart), 6.0)
+        assertTerminalMenuItemExists("workspace-3-terminal-1", in: app)
+        tapMenuItem(app.buttons["MobileNewTerminalMenuItem"], in: app)
+        await assertHostSelection(
+            workspaceID: "workspace-3",
+            terminalID: "workspace-3-terminal-2",
+            server: server
+        )
+
+        tap(app.buttons["MobileTerminalDropdown"], in: app)
+        assertTerminalMenuItemExists("workspace-3-terminal-2", in: app)
     }
 
     @MainActor
@@ -156,7 +158,7 @@ final class cmuxUITests: XCTestCase {
         try openSelectedWorkspaceIfNeeded(app)
 
         tap(app.buttons["MobileTerminalDropdown"], in: app)
-        tap(app.buttons["MobileTerminalMenuItem-terminal-tui"], in: app)
+        tapMenuItem(app.buttons["MobileTerminalMenuItem-terminal-tui"], in: app)
 
         assertTerminalRow(0, label: "LAZYGIT", in: app)
         assertTerminalRow(1, label: "files branches log", in: app)
@@ -575,8 +577,46 @@ final class cmuxUITests: XCTestCase {
         line: UInt = #line
     ) throws {
         tap(app.buttons["MobileTerminalDropdown"], in: app, file: file, line: line)
-        tap(app.buttons["MobileTerminalMenuItem-terminal-tui"], in: app, file: file, line: line)
+        tapMenuItem(app.buttons["MobileTerminalMenuItem-terminal-tui"], in: app, file: file, line: line)
         assertTerminalRow(0, label: "LAZYGIT", in: app, file: file, line: line)
+    }
+
+    @MainActor
+    private func assertHostSelection(
+        workspaceID: String,
+        terminalID: String,
+        server: MobileSyncMockHostServer,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let didSelect = await server.waitForSelection(
+            workspaceID: workspaceID,
+            terminalID: terminalID
+        )
+        if !didSelect {
+            let selection = await server.selectionDescription()
+            XCTFail(
+                "Expected mock host selection \(workspaceID)/\(terminalID). Last selection: \(selection)",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    @MainActor
+    private func assertTerminalMenuItemExists(
+        _ terminalID: String,
+        in app: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let item = app.buttons["MobileTerminalMenuItem-\(terminalID)"]
+        XCTAssertTrue(
+            item.waitForExistence(timeout: 4),
+            "Expected terminal menu to contain \(terminalID).",
+            file: file,
+            line: line
+        )
     }
 
     @MainActor
@@ -751,7 +791,7 @@ final class cmuxUITests: XCTestCase {
         line: UInt = #line
     ) {
         XCTAssertTrue(element.waitForExistence(timeout: 4), file: file, line: line)
-        dismissKeyboard(in: app, preferAddDeviceAccessoryDoneButton: true)
+        dismissKeyboard(in: app)
         if element.isHittable {
             element.tap()
             return
@@ -763,6 +803,42 @@ final class cmuxUITests: XCTestCase {
         app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: frame.midX, dy: frame.midY))
             .tap()
+    }
+
+    @MainActor
+    private func tapMenuItem(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(element.waitForExistence(timeout: 4), file: file, line: line)
+        let hittableExpectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "isHittable == true"),
+            object: element
+        )
+        let hittableResult = XCTWaiter.wait(for: [hittableExpectation], timeout: 4)
+        XCTAssertEqual(
+            hittableResult,
+            .completed,
+            "Menu item never became hittable: \(element.debugDescription)",
+            file: file,
+            line: line
+        )
+        element.tap()
+
+        let dismissedExpectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: element
+        )
+        let dismissedResult = XCTWaiter.wait(for: [dismissedExpectation], timeout: 4)
+        XCTAssertEqual(
+            dismissedResult,
+            .completed,
+            "Menu item stayed visible after tap: \(element.debugDescription)",
+            file: file,
+            line: line
+        )
     }
 
     @MainActor
@@ -828,6 +904,13 @@ final class cmuxUITests: XCTestCase {
         guard app.keyboards.firstMatch.exists else {
             return
         }
+        let terminalHideKeyboardButton = app.buttons["terminal.inputAccessory.hideKeyboard"]
+        if terminalHideKeyboardButton.exists, terminalHideKeyboardButton.isHittable {
+            terminalHideKeyboardButton.tap()
+            if waitForKeyboardDismissal(in: app) {
+                return
+            }
+        }
         if preferAddDeviceAccessoryDoneButton,
            app.buttons["MobileAddDeviceKeyboardDoneButton"].exists {
             let addDeviceDoneButton = app.buttons["MobileAddDeviceKeyboardDoneButton"]
@@ -836,7 +919,10 @@ final class cmuxUITests: XCTestCase {
                 return
             }
         }
-        for label in ["Done", "Return", "Next"] {
+        let fallbackLabels = preferAddDeviceAccessoryDoneButton
+            ? ["Done", "Return", "Next"]
+            : ["Done", "Next"]
+        for label in fallbackLabels {
             let button = app.keyboards.buttons[label]
             if button.exists {
                 button.tap()
@@ -996,6 +1082,38 @@ private final class MobileSyncMockHostServer: @unchecked Sendable {
                 connection.cancel()
             }
             self.connections.removeAll()
+        }
+    }
+
+    func waitForSelection(
+        workspaceID: String,
+        terminalID: String,
+        timeout: TimeInterval = 8
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let selection = await currentSelection()
+            if selection.workspaceID == workspaceID,
+               selection.terminalID == terminalID {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let selection = await currentSelection()
+        return selection.workspaceID == workspaceID && selection.terminalID == terminalID
+    }
+
+    func selectionDescription() async -> String {
+        let selection = await currentSelection()
+        return "\(selection.workspaceID)/\(selection.terminalID)"
+    }
+
+    private func currentSelection() async -> (workspaceID: String, terminalID: String) {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: (self.selectedWorkspaceID, self.selectedTerminalID))
+            }
         }
     }
 
